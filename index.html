@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Together Watch</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="app" class="app-shell">
+      <section id="loadingScreen" class="screen screen-active">
+        <div class="card centered">
+          <h1>Together Watch</h1>
+          <p>جاري تهيئة التطبيق...</p>
+        </div>
+      </section>
+
+      <section id="profileScreen" class="screen">
+        <div class="card">
+          <h2>إعداد حسابك</h2>
+          <p>اكتب اسمك واختر صورة بروفايل قبل الدخول.</p>
+          <form id="profileForm" class="form-stack">
+            <label>
+              الاسم
+              <input id="profileNameInput" type="text" maxlength="28" placeholder="اسمك" required />
+            </label>
+            <label>
+              صورة البروفايل
+              <input id="profileAvatarInput" type="file" accept="image/*" />
+            </label>
+            <div class="avatar-preview-wrap">
+              <img id="profileAvatarPreview" class="avatar avatar-lg" alt="صورة البروفايل" />
+              <span id="avatarHint">لم يتم اختيار صورة بعد</span>
+            </div>
+            <button id="profileSubmitBtn" type="submit" class="btn btn-primary">دخول</button>
+          </form>
+        </div>
+      </section>
+
+      <section id="homeScreen" class="screen">
+        <div class="card">
+          <h2>مرحباً <span id="homeProfileName"></span></h2>
+          <p>اختر ما تريد الآن.</p>
+          <div class="action-row">
+            <button id="showCreateRoomBtn" class="btn btn-primary">إنشاء غرفة</button>
+            <button id="showJoinRoomBtn" class="btn btn-secondary">الانضمام إلى غرفة</button>
+          </div>
+
+          <div id="createRoomPanel" class="panel hidden">
+            <h3>إنشاء غرفة جديدة</h3>
+            <form id="createRoomForm" class="form-stack">
+              <label>
+                اسم الغرفة
+                <input id="roomNameInput" type="text" maxlength="40" placeholder="مثال: فيلم الليلة" required />
+              </label>
+              <label>
+                تحميل فيديو أولي
+                <input id="initialVideoInput" type="file" accept="video/*" required />
+              </label>
+              <div id="initialUploadArea" class="upload-area hidden">
+                <div class="upload-header">
+                  <span id="initialUploadFileName">-</span>
+                  <span id="initialUploadPercent">0%</span>
+                </div>
+                <div class="progress-track"><div id="initialUploadBar" class="progress-bar"></div></div>
+              </div>
+              <button id="createRoomSubmitBtn" type="submit" class="btn btn-primary">إنشاء ورفع الفيديو</button>
+            </form>
+          </div>
+
+          <div id="joinRoomPanel" class="panel hidden">
+            <h3>الغرف المفتوحة الآن</h3>
+            <div id="roomsList" class="room-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="roomScreen" class="screen room-screen">
+        <header class="room-topbar">
+          <button id="profileChipBtn" class="profile-chip" title="حسابي">
+            <img id="roomProfileAvatar" class="avatar" alt="صورة البروفايل" />
+            <span id="roomProfileName"></span>
+          </button>
+
+          <div class="room-top-actions">
+            <button id="viewerCountBtn" class="btn btn-ghost">المشاهدين: <span id="viewerCount">0</span></button>
+            <button id="openDrawerBtn" class="menu-btn" title="القائمة">⋮</button>
+          </div>
+        </header>
+
+        <section class="video-section">
+          <div class="video-card">
+            <div class="video-head">
+              <h3 id="roomTitle">الغرفة</h3>
+              <span id="hostBadge" class="host-badge">مشاهد</span>
+            </div>
+            <div class="player-wrap" id="playerWrap">
+              <video id="roomVideo" playsinline preload="auto"></video>
+            </div>
+            <div class="player-controls" id="playerControls">
+              <button id="playPauseBtn" class="btn btn-primary control-host">تشغيل</button>
+              <button id="seekBackBtn" class="btn btn-secondary control-host">-10ث</button>
+              <button id="seekForwardBtn" class="btn btn-secondary control-host">+10ث</button>
+              <input id="seekRange" class="control-host" type="range" min="0" max="100" value="0" />
+              <span id="timeLabel">00:00 / 00:00</span>
+              <button id="fullscreenBtn" class="btn btn-secondary">تكبير العرض</button>
+            </div>
+          </div>
+        </section>
+
+        <section id="chatSection" class="chat-section">
+          <div id="chatMessages" class="chat-messages"></div>
+          <form id="chatForm" class="chat-form">
+            <input id="chatInput" type="text" maxlength="350" placeholder="اكتب رسالة..." />
+            <button type="submit" class="btn btn-primary">إرسال</button>
+          </form>
+        </section>
+      </section>
+
+      <aside id="sideDrawer" class="side-drawer">
+        <div class="drawer-head">
+          <h3>خيارات الغرفة</h3>
+          <button id="closeDrawerBtn" class="btn btn-ghost">إغلاق</button>
+        </div>
+        <div class="drawer-content">
+          <button id="copyRoomLinkBtn" class="btn btn-secondary full">نسخ رابط الغرفة</button>
+          <button id="toggleUploadsBtn" class="btn btn-secondary full">تحميل فيديوهات</button>
+
+          <div id="uploadsPanel" class="panel hidden">
+            <div class="current-video-box">
+              <span>الفيديو الحالي:</span>
+              <strong id="currentVideoStatus">لا يوجد</strong>
+            </div>
+            <label class="full">
+              <span>اختيار فيديو/فيديوهات</span>
+              <input id="queueVideoInput" type="file" accept="video/*" multiple />
+            </label>
+            <div id="uploadQueueList" class="upload-queue"></div>
+            <h4>الفيديوهات المرفوعة</h4>
+            <div id="videosList" class="videos-list"></div>
+          </div>
+        </div>
+      </aside>
+
+      <div id="drawerOverlay" class="overlay hidden"></div>
+
+      <div id="participantsModal" class="modal hidden">
+        <div class="modal-card">
+          <div class="modal-head">
+            <h3>المشاهدون الآن</h3>
+            <button id="closeParticipantsModalBtn" class="btn btn-ghost">إغلاق</button>
+          </div>
+          <div id="participantsList" class="participants-list"></div>
+        </div>
+      </div>
+
+      <div id="switchVideoModal" class="modal hidden">
+        <div class="modal-card">
+          <h3>تأكيد عرض الفيديو</h3>
+          <p id="switchVideoText"></p>
+          <div class="action-row">
+            <button id="confirmSwitchVideoBtn" class="btn btn-primary">عرض</button>
+            <button id="cancelSwitchVideoBtn" class="btn btn-secondary">إلغاء</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="profileMenuModal" class="modal hidden">
+        <div class="modal-card">
+          <h3>إعدادات الحساب</h3>
+          <div class="form-stack">
+            <button id="editNameBtn" class="btn btn-secondary full">تعديل الاسم</button>
+            <label class="btn btn-secondary full file-like">
+              تغيير صورة البروفايل
+              <input id="changeAvatarInput" type="file" accept="image/*" />
+            </label>
+            <button id="logoutBtn" class="btn btn-danger full">تسجيل خروج</button>
+            <button id="closeProfileMenuBtn" class="btn btn-ghost full">إغلاق</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="toast" class="toast"></div>
+    </div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
