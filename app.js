@@ -6,28 +6,17 @@ import {
   signOut
 } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
 import {
-  getFirestore,
-  doc,
-  setDoc,
-  getDoc,
-  updateDoc,
-  addDoc,
-  deleteDoc,
-  collection,
-  onSnapshot,
-  serverTimestamp,
-  query,
-  orderBy,
-  writeBatch,
-  getDocs,
-  where
-} from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
-import {
-  getStorage,
+  getDatabase,
   ref,
-  uploadBytesResumable,
-  getDownloadURL
-} from "https://www.gstatic.com/firebasejs/10.14.1/firebase-storage.js";
+  get,
+  set,
+  update,
+  remove,
+  push,
+  onValue,
+  onChildAdded,
+  onDisconnect
+} from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
 
 const userConfig = {
   apiKey: "AIzaSyAcIwwapktH2nxyZczVKFacTrLh1o-EgdM",
@@ -36,20 +25,23 @@ const userConfig = {
   storageBucket: "shakkak-8f90f.firebasestorage.app",
   messagingSenderId: "1039276785290",
   appId: "1:1039276785290:web:ed874a451b37fb3210f773",
-  measurementId: "G-QRH0Z1HM5R"
+  measurementId: "G-QRH0Z1HM5R",
+  databaseURL: "https://shakkak-8f90f-default-rtdb.firebaseio.com"
 };
 
 const APP_DOMAIN = "https://arbtha.github.io/together/";
 const PROFILE_STORAGE_KEY = "together_watch_profile";
-const PRESENCE_TIMEOUT_MS = 30_000;
-const HEARTBEAT_MS = 12_000;
-const PLAYBACK_PUSH_MS = 1_000;
+const PRESENCE_TIMEOUT_MS = 35_000;
+const HEARTBEAT_MS = 10_000;
+const OFFER_REQUEST_COOLDOWN_MS = 2_200;
+const RTC_CONFIG = {
+  iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+};
 
 const state = {
   app: null,
   auth: null,
   db: null,
-  storage: null,
   user: null,
   profile: {
     name: "",
@@ -59,20 +51,22 @@ const state = {
   roomId: null,
   roomData: null,
   isHost: false,
-  loadedVideoId: null,
-  loadedVideoUrl: "",
   participants: new Map(),
   roomVideos: [],
+  localVideos: new Map(),
   uploadQueue: [],
   isUploadingQueue: false,
   switchTargetVideo: null,
-  lastPlaybackPushAt: 0,
-  roomUnsub: null,
-  participantsUnsub: null,
-  chatUnsub: null,
-  videosUnsub: null,
+  roomUnsubs: [],
   openRoomsUnsub: null,
-  heartbeatInterval: null
+  heartbeatInterval: null,
+  presenceDisconnect: null,
+  hostPeers: new Map(),
+  viewerPeer: null,
+  viewerHostUid: null,
+  hostStream: null,
+  lastOfferRequestAt: 0,
+  hasRequestedInitialOffer: false
 };
 
 const refs = {
@@ -147,7 +141,7 @@ const refs = {
 
 start().catch((error) => {
   console.error(error);
-  showToast("حدث خطأ أثناء تشغيل التطبيق");
+  showToast("فشل تشغيل التطبيق");
   showScreen("profile");
 });
 
@@ -166,8 +160,7 @@ async function start() {
 function initFirebase() {
   state.app = initializeApp(userConfig);
   state.auth = getAuth(state.app);
-  state.db = getFirestore(state.app);
-  state.storage = getStorage(state.app);
+  state.db = getDatabase(state.app);
 }
 
 function bindEvents() {
@@ -205,9 +198,8 @@ function bindEvents() {
 
   refs.roomVideo.addEventListener("timeupdate", onVideoTimeUpdate);
   refs.roomVideo.addEventListener("loadedmetadata", onVideoLoadedMetadata);
-  refs.roomVideo.addEventListener("play", () => pushPlaybackState(true));
-  refs.roomVideo.addEventListener("pause", () => pushPlaybackState(true));
-  refs.roomVideo.addEventListener("seeking", () => pushPlaybackState(true));
+  refs.roomVideo.addEventListener("play", onVideoPlayStateChange);
+  refs.roomVideo.addEventListener("pause", onVideoPlayStateChange);
 
   refs.chatForm.addEventListener("submit", onChatSubmit);
 
@@ -231,9 +223,7 @@ function bindEvents() {
 
   window.addEventListener("beforeunload", () => {
     if (state.roomId) {
-      setTimeout(() => {
-        leaveRoom({ goingOffline: true }).catch(() => {});
-      }, 0);
+      leaveRoom({ keepHome: true, goingOffline: true }).catch(() => {});
     }
   });
 }
@@ -256,9 +246,11 @@ async function ensureAuthReady() {
 
   if (!firstUser) {
     await signInAnonymously(state.auth);
-    state.user = state.auth.currentUser;
-  } else {
-    state.user = firstUser;
+  }
+
+  state.user = state.auth.currentUser;
+  if (!state.user) {
+    throw new Error("anonymous-auth-not-available");
   }
 }
 
@@ -306,7 +298,7 @@ async function onProfileSubmit(event) {
   event.preventDefault();
 
   if (!state.user) {
-    showToast("فشل تسجيل الدخول المجهول. فعّل Anonymous Auth في Firebase");
+    showToast("فعّل Anonymous Authentication في Firebase");
     return;
   }
 
@@ -336,7 +328,6 @@ async function onProfileSubmit(event) {
   if (state.pendingRoomFromLink) {
     const targetRoom = state.pendingRoomFromLink;
     state.pendingRoomFromLink = null;
-    showToast("جاري الانضمام للرابط...");
     await joinRoom(targetRoom);
   }
 }
@@ -357,74 +348,45 @@ async function onCreateRoomSubmit(event) {
     return;
   }
 
+  refs.createRoomSubmitBtn.disabled = true;
+  refs.initialUploadArea.classList.remove("hidden");
+  refs.initialUploadFileName.textContent = firstVideo.name;
+  updateProgress(refs.initialUploadBar, refs.initialUploadPercent, 0);
+
   try {
-    refs.createRoomSubmitBtn.disabled = true;
-    refs.initialUploadArea.classList.remove("hidden");
-    refs.initialUploadFileName.textContent = firstVideo.name;
-    updateProgress(refs.initialUploadBar, refs.initialUploadPercent, 0);
+    const localVideo = await prepareLocalVideo(firstVideo, (percent) => {
+      updateProgress(refs.initialUploadBar, refs.initialUploadPercent, percent);
+    });
+
+    state.localVideos.set(localVideo.id, localVideo);
 
     const roomId = generateRoomId();
-    const roomRef = doc(state.db, "rooms", roomId);
-
-    await setDoc(roomRef, {
+    const now = Date.now();
+    const meta = {
       id: roomId,
       name: roomName,
       hostUid: state.user.uid,
       hostName: state.profile.name,
       hostAvatar: state.profile.avatar,
-      createdAt: serverTimestamp(),
+      currentVideoId: localVideo.id,
+      currentVideoTitle: localVideo.title,
       isOpen: true,
       viewerCount: 1,
-      currentVideoId: "",
-      currentVideoUrl: "",
-      currentVideoTitle: "",
-      playback: {
-        time: 0,
-        paused: true,
-        byUid: state.user.uid,
-        updatedAt: Date.now(),
-        videoId: ""
-      },
-      lastActivity: serverTimestamp()
-    });
+      createdAt: now,
+      updatedAt: now
+    };
 
-    await upsertParticipant(roomId, { initial: true });
+    const updates = {};
+    updates[`rooms/${roomId}/meta`] = meta;
+    updates[`rooms/${roomId}/videos/${localVideo.id}`] = buildVideoRecord(localVideo);
+    updates[`publicRooms/${roomId}`] = buildPublicRoomRecord(meta);
 
-    const uploaded = await uploadVideoWithProgress({
-      roomId,
-      file: firstVideo,
-      onProgress: (percent) => updateProgress(refs.initialUploadBar, refs.initialUploadPercent, percent)
-    });
-
-    const videoDocRef = await addDoc(collection(state.db, `rooms/${roomId}/videos`), {
-      title: uploaded.title,
-      url: uploaded.url,
-      filePath: uploaded.filePath,
-      size: uploaded.size,
-      uploadedByUid: state.user.uid,
-      uploadedByName: state.profile.name,
-      uploadedAt: serverTimestamp()
-    });
-
-    await updateDoc(roomRef, {
-      currentVideoId: videoDocRef.id,
-      currentVideoUrl: uploaded.url,
-      currentVideoTitle: uploaded.title,
-      playback: {
-        time: 0,
-        paused: true,
-        byUid: state.user.uid,
-        updatedAt: Date.now(),
-        videoId: videoDocRef.id
-      },
-      lastActivity: serverTimestamp()
-    });
-
-    await joinRoom(roomId);
+    await update(ref(state.db), updates);
+    await joinRoom(roomId, { preferredHostVideoId: localVideo.id });
 
     refs.createRoomForm.reset();
     refs.initialUploadArea.classList.add("hidden");
-    showToast("تم إنشاء الغرفة بنجاح");
+    showToast("تم إنشاء الغرفة");
   } catch (error) {
     console.error(error);
     showToast(humanizeFirebaseError(error));
@@ -433,40 +395,39 @@ async function onCreateRoomSubmit(event) {
   }
 }
 
-async function joinRoom(roomId) {
+async function joinRoom(roomId, { preferredHostVideoId = "" } = {}) {
   if (!roomId) {
     return;
   }
 
+  if (state.roomId && state.roomId !== roomId) {
+    await leaveRoom({ keepHome: true });
+  }
+
   try {
-    if (state.roomId && state.roomId !== roomId) {
-      await leaveRoom({ keepHome: true });
-    }
-
-    const roomRef = doc(state.db, "rooms", roomId);
-    const roomSnap = await getDoc(roomRef);
-
-    if (!roomSnap.exists()) {
+    const metaSnap = await get(ref(state.db, `rooms/${roomId}/meta`));
+    if (!metaSnap.exists()) {
       showToast("الغرفة غير موجودة");
       showScreen("home");
       clearRoomInUrl();
       return;
     }
 
-    const roomData = roomSnap.data();
-    if (!roomData.isOpen) {
-      showToast("هذه الغرفة مغلقة حالياً");
+    const meta = metaSnap.val();
+    if (!meta.isOpen) {
+      showToast("هذه الغرفة مغلقة");
       showScreen("home");
       clearRoomInUrl();
       return;
     }
 
     state.roomId = roomId;
-    state.roomData = roomData;
-    state.loadedVideoId = "";
-    state.loadedVideoUrl = "";
+    state.roomData = meta;
+    state.isHost = meta.hostUid === state.user.uid;
+    state.hasRequestedInitialOffer = false;
 
     await upsertParticipant(roomId, { initial: true });
+    await setupPresenceDisconnect(roomId);
     subscribeRoomListeners(roomId);
     startHeartbeat(roomId);
 
@@ -475,174 +436,225 @@ async function joinRoom(roomId) {
     closeDrawer();
     closeModal(refs.participantsModal);
     closeModal(refs.profileMenuModal);
+
     refs.chatInput.value = "";
     refs.chatMessages.innerHTML = "";
-    refs.currentVideoStatus.textContent = roomData.currentVideoTitle || "لا يوجد";
 
-    applyRoomHeader(roomData);
+    applyRoomHeader(meta);
+    applyRoleBasedControls();
+
+    if (state.isHost) {
+      const targetVideoId = preferredHostVideoId || meta.currentVideoId;
+      if (targetVideoId) {
+        loadHostLocalVideo(targetVideoId, { autoPlay: false });
+      }
+    } else {
+      enableViewerModeVideoElement();
+      requestOfferFromCurrentHost();
+    }
   } catch (error) {
     console.error(error);
     showToast(humanizeFirebaseError(error));
   }
 }
 
-function subscribeRoomListeners(roomId) {
-  cleanupRoomListeners();
-
-  const roomRef = doc(state.db, "rooms", roomId);
-  state.roomUnsub = onSnapshot(roomRef, async (snapshot) => {
-    if (!snapshot.exists()) {
-      showToast("تم حذف الغرفة");
-      await leaveRoom({ keepHome: true });
-      showScreen("home");
-      clearRoomInUrl();
-      return;
-    }
-
-    const data = snapshot.data();
-    state.roomData = data;
-    state.isHost = data.hostUid === state.user.uid;
-
-    applyRoomHeader(data);
-    applyRoleBasedControls();
-
-    if (data.currentVideoUrl && data.currentVideoId) {
-      if (state.loadedVideoId !== data.currentVideoId) {
-        loadRoomVideo({
-          videoId: data.currentVideoId,
-          url: data.currentVideoUrl,
-          title: data.currentVideoTitle
-        });
-      }
-    }
-
-    if (data.playback) {
-      syncPlaybackFromRoom(data.playback);
-    }
-
-    refs.currentVideoStatus.textContent = data.currentVideoTitle || "لا يوجد";
-  });
-
-  const participantsRef = collection(state.db, `rooms/${roomId}/participants`);
-  state.participantsUnsub = onSnapshot(participantsRef, (snapshot) => {
-    const now = Date.now();
-    state.participants.clear();
-
-    snapshot.forEach((participantDoc) => {
-      const participant = participantDoc.data();
-      if ((participant.lastSeen || 0) > now - PRESENCE_TIMEOUT_MS) {
-        state.participants.set(participantDoc.id, participant);
-      }
-    });
-
-    refs.viewerCount.textContent = String(state.participants.size);
-    renderParticipants();
-
-    if (state.roomId && state.isHost) {
-      updateDoc(doc(state.db, "rooms", state.roomId), {
-        viewerCount: state.participants.size,
-        lastActivity: serverTimestamp()
-      }).catch(() => {});
-    }
-  });
-
-  const chatQuery = query(collection(state.db, `rooms/${roomId}/chat`), orderBy("createdAt", "asc"));
-  state.chatUnsub = onSnapshot(chatQuery, (snapshot) => {
-    const fragments = [];
-    snapshot.forEach((messageDoc) => {
-      const message = messageDoc.data();
-      fragments.push(renderMessageHtml(message));
-    });
-
-    refs.chatMessages.innerHTML = fragments.join("");
-    refs.chatMessages.scrollTop = refs.chatMessages.scrollHeight;
-  });
-
-  const videosQuery = query(collection(state.db, `rooms/${roomId}/videos`), orderBy("uploadedAt", "asc"));
-  state.videosUnsub = onSnapshot(videosQuery, (snapshot) => {
-    state.roomVideos = snapshot.docs.map((videoDoc) => ({ id: videoDoc.id, ...videoDoc.data() }));
-    renderVideosList();
-  });
-}
-
 async function leaveRoom({ keepHome = false, goingOffline = false } = {}) {
   if (!state.roomId) {
+    if (!keepHome) {
+      showScreen("home");
+    }
     return;
   }
 
   const leavingRoomId = state.roomId;
   const wasHost = state.isHost;
-  const roomRef = doc(state.db, "rooms", leavingRoomId);
-
-  try {
-    if (!goingOffline) {
-      if (wasHost) {
-        await transferHostToNextParticipant(leavingRoomId);
-      }
-
-      await deleteDoc(doc(state.db, `rooms/${leavingRoomId}/participants`, state.user.uid));
-
-      if (!wasHost) {
-        await updateDoc(roomRef, {
-          lastActivity: serverTimestamp()
-        }).catch(() => {});
-      }
-    }
-  } catch (error) {
-    console.error(error);
-  }
 
   stopHeartbeat();
   cleanupRoomListeners();
+  closeAllHostPeers();
+  closeViewerPeer();
+
+  if (state.presenceDisconnect) {
+    try {
+      await state.presenceDisconnect.cancel();
+    } catch {
+      // no-op
+    }
+    state.presenceDisconnect = null;
+  }
+
+  if (!goingOffline) {
+    try {
+      if (wasHost) {
+        await transferHostOnLeave(leavingRoomId);
+      }
+      await remove(ref(state.db, `rooms/${leavingRoomId}/participants/${state.user.uid}`));
+      await cleanupRoomIfEmpty(leavingRoomId);
+    } catch (error) {
+      console.error(error);
+    }
+  }
 
   state.roomId = null;
   state.roomData = null;
-  state.loadedVideoId = "";
-  state.loadedVideoUrl = "";
+  state.isHost = false;
   state.participants.clear();
   state.roomVideos = [];
-  state.isHost = false;
   state.uploadQueue = [];
   state.isUploadingQueue = false;
   state.switchTargetVideo = null;
+  state.hostStream = null;
+  state.lastOfferRequestAt = 0;
 
   refs.uploadQueueList.innerHTML = "";
   refs.videosList.innerHTML = "";
   refs.viewerCount.textContent = "0";
-  refs.roomVideo.pause();
-  refs.roomVideo.removeAttribute("src");
-  refs.roomVideo.load();
   refs.chatMessages.innerHTML = "";
+  refs.currentVideoStatus.textContent = "لا يوجد";
+  resetVideoElement();
 
+  clearRoomInUrl();
   if (!keepHome) {
     showScreen("home");
   }
-  clearRoomInUrl();
+}
+
+function subscribeRoomListeners(roomId) {
+  cleanupRoomListeners();
+
+  const roomMetaRef = ref(state.db, `rooms/${roomId}/meta`);
+  const participantsRef = ref(state.db, `rooms/${roomId}/participants`);
+  const chatRef = ref(state.db, `rooms/${roomId}/chat`);
+  const videosRef = ref(state.db, `rooms/${roomId}/videos`);
+  const signalsRef = ref(state.db, `rooms/${roomId}/signals/${state.user.uid}`);
+
+  const unsubMeta = onValue(roomMetaRef, async (snapshot) => {
+    if (!snapshot.exists()) {
+      showToast("تم إغلاق الغرفة");
+      await leaveRoom({ keepHome: true });
+      showScreen("home");
+      return;
+    }
+
+    const prevHostUid = state.roomData?.hostUid || "";
+    const nextMeta = snapshot.val();
+    const prevVideoId = state.roomData?.currentVideoId || "";
+
+    state.roomData = nextMeta;
+    const wasHost = state.isHost;
+    state.isHost = nextMeta.hostUid === state.user.uid;
+
+    applyRoomHeader(nextMeta);
+    applyRoleBasedControls();
+    refs.currentVideoStatus.textContent = nextMeta.currentVideoTitle || "لا يوجد";
+
+    if (!wasHost && state.isHost) {
+      startHostMode();
+      await upsertParticipant(roomId, { initial: false });
+    }
+
+    if (wasHost && !state.isHost) {
+      stopHostMode();
+      enableViewerModeVideoElement();
+      requestOfferFromCurrentHost();
+    }
+
+    if (prevHostUid !== nextMeta.hostUid && !state.isHost) {
+      closeViewerPeer();
+      requestOfferFromCurrentHost();
+    }
+
+    if (state.isHost && nextMeta.currentVideoId && nextMeta.currentVideoId !== prevVideoId) {
+      loadHostLocalVideo(nextMeta.currentVideoId, { autoPlay: false });
+    }
+  });
+
+  const unsubParticipants = onValue(participantsRef, async (snapshot) => {
+    const raw = snapshot.val() || {};
+    const now = Date.now();
+    const map = new Map();
+
+    for (const [uid, participant] of Object.entries(raw)) {
+      if ((participant.lastSeen || 0) > now - PRESENCE_TIMEOUT_MS) {
+        map.set(uid, participant);
+      }
+    }
+
+    state.participants = map;
+    refs.viewerCount.textContent = String(map.size);
+    renderParticipants();
+
+    if (state.roomData && !map.has(state.roomData.hostUid)) {
+      await tryElectHostIfMissing();
+    }
+
+    if (state.isHost) {
+      await syncViewerCount(map.size);
+      reconcileHostPeers([...map.keys()].filter((uid) => uid !== state.user.uid));
+    } else if (!state.hasRequestedInitialOffer) {
+      requestOfferFromCurrentHost();
+    }
+  });
+
+  const unsubChat = onValue(chatRef, (snapshot) => {
+    const raw = snapshot.val() || {};
+    const messages = Object.values(raw).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+
+    refs.chatMessages.innerHTML = messages.map((message) => renderMessageHtml(message)).join("");
+    refs.chatMessages.scrollTop = refs.chatMessages.scrollHeight;
+  });
+
+  const unsubVideos = onValue(videosRef, (snapshot) => {
+    const raw = snapshot.val() || {};
+    state.roomVideos = Object.entries(raw)
+      .map(([id, payload]) => ({ id, ...payload }))
+      .sort((a, b) => (a.addedAt || 0) - (b.addedAt || 0));
+
+    renderVideosList();
+  });
+
+  const unsubSignals = onChildAdded(signalsRef, async (snapshot) => {
+    const signal = snapshot.val();
+    if (!signal) {
+      return;
+    }
+
+    try {
+      await handleSignal(signal);
+    } catch (error) {
+      console.error(error);
+    } finally {
+      remove(snapshot.ref).catch(() => {});
+    }
+  });
+
+  state.roomUnsubs.push(unsubMeta, unsubParticipants, unsubChat, unsubVideos, unsubSignals);
 }
 
 function cleanupRoomListeners() {
-  if (state.roomUnsub) {
-    state.roomUnsub();
-    state.roomUnsub = null;
-  }
-  if (state.participantsUnsub) {
-    state.participantsUnsub();
-    state.participantsUnsub = null;
-  }
-  if (state.chatUnsub) {
-    state.chatUnsub();
-    state.chatUnsub = null;
-  }
-  if (state.videosUnsub) {
-    state.videosUnsub();
-    state.videosUnsub = null;
-  }
+  state.roomUnsubs.forEach((unsub) => {
+    try {
+      unsub();
+    } catch {
+      // no-op
+    }
+  });
+  state.roomUnsubs = [];
+}
+
+async function setupPresenceDisconnect(roomId) {
+  const participantRef = ref(state.db, `rooms/${roomId}/participants/${state.user.uid}`);
+  state.presenceDisconnect = onDisconnect(participantRef);
+  await state.presenceDisconnect.remove();
 }
 
 function startHeartbeat(roomId) {
   stopHeartbeat();
   state.heartbeatInterval = setInterval(() => {
     upsertParticipant(roomId).catch(() => {});
+    if (state.isHost) {
+      touchRoomActivity().catch(() => {});
+    }
   }, HEARTBEAT_MS);
 }
 
@@ -658,20 +670,19 @@ async function upsertParticipant(roomId, { initial = false } = {}) {
     return;
   }
 
-  const participantRef = doc(state.db, `rooms/${roomId}/participants`, state.user.uid);
-  const baseData = {
+  const payload = {
     uid: state.user.uid,
     name: state.profile.name,
     avatar: state.profile.avatar,
-    isHost: state.roomData?.hostUid === state.user.uid,
+    isHost: state.isHost,
     lastSeen: Date.now()
   };
 
   if (initial) {
-    baseData.joinedAt = serverTimestamp();
+    payload.joinedAt = Date.now();
   }
 
-  await setDoc(participantRef, baseData, { merge: true });
+  await update(ref(state.db, `rooms/${roomId}/participants/${state.user.uid}`), payload);
 }
 
 function applyRoomHeader(roomData) {
@@ -680,7 +691,7 @@ function applyRoomHeader(roomData) {
   refs.roomProfileName.textContent = state.profile.name;
 
   if (state.isHost) {
-    refs.hostBadge.textContent = "أنت منشئ/مدير الغرفة";
+    refs.hostBadge.textContent = "أنت مدير الغرفة";
   } else {
     refs.hostBadge.textContent = `المدير: ${roomData.hostName || "-"}`;
   }
@@ -688,8 +699,8 @@ function applyRoomHeader(roomData) {
 
 function applyRoleBasedControls() {
   const hostControls = document.querySelectorAll(".control-host");
-  hostControls.forEach((element) => {
-    element.style.display = state.isHost ? "" : "none";
+  hostControls.forEach((node) => {
+    node.style.display = state.isHost ? "" : "none";
   });
 
   refs.playPauseBtn.style.display = state.isHost ? "inline-flex" : "none";
@@ -697,72 +708,98 @@ function applyRoleBasedControls() {
   refs.seekForwardBtn.style.display = state.isHost ? "inline-flex" : "none";
 }
 
-function loadRoomVideo({ videoId, url, title }) {
-  if (!url || !videoId) {
-    return;
+function startHostMode() {
+  closeViewerPeer();
+  refs.currentVideoStatus.textContent = state.roomData?.currentVideoTitle || "لا يوجد";
+
+  if (state.roomData?.currentVideoId) {
+    loadHostLocalVideo(state.roomData.currentVideoId, { autoPlay: false });
+  } else {
+    resetVideoElement();
   }
 
-  state.loadedVideoId = videoId;
-  state.loadedVideoUrl = url;
-  refs.roomVideo.src = url;
-  refs.roomVideo.load();
-  refs.currentVideoStatus.textContent = title || "فيديو";
+  reconcileHostPeers([...state.participants.keys()].filter((uid) => uid !== state.user.uid));
+}
+
+function stopHostMode() {
+  closeAllHostPeers();
+  state.hostStream = null;
+}
+
+function resetVideoElement() {
+  const video = refs.roomVideo;
+  video.pause();
+  if (video.srcObject) {
+    video.srcObject = null;
+  }
+  video.removeAttribute("src");
+  video.load();
+  refs.playPauseBtn.textContent = "تشغيل";
+  refs.seekRange.value = "0";
+  updateTimeLabel();
+}
+
+function enableViewerModeVideoElement() {
+  const video = refs.roomVideo;
+  video.pause();
+  if (video.src) {
+    video.removeAttribute("src");
+    video.load();
+  }
   refs.playPauseBtn.textContent = "تشغيل";
 }
 
-function syncPlaybackFromRoom(playback) {
-  if (!playback || !state.roomId) {
+function loadHostLocalVideo(videoId, { autoPlay = false } = {}) {
+  if (!state.isHost) {
+    return;
+  }
+
+  const localVideo = state.localVideos.get(videoId);
+  if (!localVideo) {
+    showToast("هذا الفيديو غير متاح على جهاز المدير الحالي");
     return;
   }
 
   const video = refs.roomVideo;
-
-  if (!state.loadedVideoId || playback.videoId !== state.loadedVideoId) {
-    return;
+  video.pause();
+  if (video.srcObject) {
+    video.srcObject = null;
   }
+  video.src = localVideo.url;
+  video.load();
 
-  if (state.isHost && playback.byUid === state.user.uid) {
-    return;
+  refs.currentVideoStatus.textContent = localVideo.title;
+  refs.playPauseBtn.textContent = "تشغيل";
+
+  if (autoPlay) {
+    video.play().catch(() => {
+      showToast("اضغط تشغيل لبدء البث");
+    });
   }
-
-  const targetTime = Number(playback.time || 0);
-  const delta = Math.abs((video.currentTime || 0) - targetTime);
-
-  if (Number.isFinite(targetTime) && delta > 1.2) {
-    video.currentTime = targetTime;
-  }
-
-  if (playback.paused) {
-    if (!video.paused) {
-      video.pause();
-    }
-  } else {
-    video.play().catch(() => {});
-  }
-
-  refs.playPauseBtn.textContent = video.paused ? "تشغيل" : "إيقاف";
 }
 
 function onVideoLoadedMetadata() {
   updateTimeLabel();
+  if (state.isHost) {
+    ensureHostCaptureStream();
+    renegotiateAllHostPeers();
+  }
+}
+
+function onVideoPlayStateChange() {
+  refs.playPauseBtn.textContent = refs.roomVideo.paused ? "تشغيل" : "إيقاف";
+  if (state.isHost) {
+    ensureHostCaptureStream();
+    renegotiateAllHostPeers();
+    touchRoomActivity().catch(() => {});
+  }
 }
 
 function onVideoTimeUpdate() {
   updateTimeLabel();
 
-  const video = refs.roomVideo;
-  if (video.duration && Number.isFinite(video.duration)) {
-    refs.seekRange.value = String((video.currentTime / video.duration) * 100);
-  }
-
-  if (!state.isHost) {
-    return;
-  }
-
-  const now = Date.now();
-  if (now - state.lastPlaybackPushAt >= PLAYBACK_PUSH_MS) {
-    state.lastPlaybackPushAt = now;
-    pushPlaybackState(false);
+  if (state.isHost && refs.roomVideo.duration && Number.isFinite(refs.roomVideo.duration)) {
+    refs.seekRange.value = String((refs.roomVideo.currentTime / refs.roomVideo.duration) * 100);
   }
 }
 
@@ -774,35 +811,36 @@ function updateTimeLabel() {
 
 function onPlayPauseToggle() {
   if (!state.isHost) {
-    showToast("التحكم متاح لمدير الغرفة فقط");
+    showToast("التحكم للمدير فقط");
     return;
   }
 
-  if (!state.loadedVideoId) {
-    showToast("لا يوجد فيديو حالياً");
+  const video = refs.roomVideo;
+  if (!video.src) {
+    showToast("لا يوجد فيديو محلي جاهز");
     return;
   }
 
-  if (refs.roomVideo.paused) {
-    refs.roomVideo.play().catch(() => {
+  if (video.paused) {
+    video.play().catch(() => {
       showToast("تعذر تشغيل الفيديو");
     });
   } else {
-    refs.roomVideo.pause();
+    video.pause();
   }
-
-  refs.playPauseBtn.textContent = refs.roomVideo.paused ? "تشغيل" : "إيقاف";
-  pushPlaybackState(true);
 }
 
-function hostSeekBy(amount) {
+function hostSeekBy(seconds) {
   if (!state.isHost) {
     return;
   }
 
-  const next = Math.max(0, (refs.roomVideo.currentTime || 0) + amount);
-  refs.roomVideo.currentTime = next;
-  pushPlaybackState(true);
+  const video = refs.roomVideo;
+  if (!Number.isFinite(video.currentTime)) {
+    return;
+  }
+
+  video.currentTime = Math.max(0, video.currentTime + seconds);
 }
 
 function onHostSeekRangeInput(event) {
@@ -810,46 +848,17 @@ function onHostSeekRangeInput(event) {
     return;
   }
 
+  const video = refs.roomVideo;
+  if (!video.duration || !Number.isFinite(video.duration)) {
+    return;
+  }
+
   const percent = Number(event.target.value || 0);
-  if (!refs.roomVideo.duration || !Number.isFinite(refs.roomVideo.duration)) {
-    return;
-  }
-
-  refs.roomVideo.currentTime = (percent / 100) * refs.roomVideo.duration;
-  pushPlaybackState(true);
-}
-
-async function pushPlaybackState(force = false) {
-  if (!state.isHost || !state.roomId || !state.loadedVideoId) {
-    return;
-  }
-
-  const now = Date.now();
-  if (!force && now - state.lastPlaybackPushAt < PLAYBACK_PUSH_MS) {
-    return;
-  }
-
-  state.lastPlaybackPushAt = now;
-
-  const payload = {
-    playback: {
-      time: refs.roomVideo.currentTime || 0,
-      paused: refs.roomVideo.paused,
-      byUid: state.user.uid,
-      updatedAt: now,
-      videoId: state.loadedVideoId
-    },
-    lastActivity: serverTimestamp()
-  };
-
-  await updateDoc(doc(state.db, "rooms", state.roomId), payload).catch(() => {});
+  video.currentTime = (percent / 100) * video.duration;
 }
 
 function openFullscreen() {
   const player = refs.roomVideo;
-  if (!player.src) {
-    return;
-  }
 
   if (player.requestFullscreen) {
     player.requestFullscreen().catch(() => {});
@@ -871,12 +880,12 @@ async function onChatSubmit(event) {
   }
 
   try {
-    await addDoc(collection(state.db, `rooms/${state.roomId}/chat`), {
+    await push(ref(state.db, `rooms/${state.roomId}/chat`), {
       uid: state.user.uid,
       name: state.profile.name,
       avatar: state.profile.avatar,
       text,
-      createdAt: serverTimestamp()
+      createdAt: Date.now()
     });
     refs.chatInput.value = "";
   } catch (error) {
@@ -935,94 +944,160 @@ function renderParticipants() {
       if (!targetUid) {
         return;
       }
-      await transferHostToSpecificParticipant(targetUid);
+
+      const target = state.participants.get(targetUid);
+      if (!target) {
+        showToast("المشاهد غير متاح");
+        return;
+      }
+
+      await assignHost(targetUid, target.name, target.avatar);
+      showToast(`تم تعيين ${target.name} كمدير`);
     });
   });
 }
 
-async function transferHostToSpecificParticipant(targetUid) {
-  if (!state.roomId || !state.isHost) {
-    return;
-  }
-
-  const target = state.participants.get(targetUid);
-  if (!target) {
-    showToast("المشاهد غير متاح حالياً");
-    return;
-  }
-
-  try {
-    const batch = writeBatch(state.db);
-    const roomRef = doc(state.db, "rooms", state.roomId);
-
-    batch.update(roomRef, {
-      hostUid: targetUid,
-      hostName: target.name,
-      hostAvatar: target.avatar,
-      lastActivity: serverTimestamp()
-    });
-
-    batch.update(doc(state.db, `rooms/${state.roomId}/participants`, state.user.uid), {
-      isHost: false
-    });
-
-    batch.update(doc(state.db, `rooms/${state.roomId}/participants`, targetUid), {
-      isHost: true
-    });
-
-    await batch.commit();
-    showToast(`تم تعيين ${target.name} كمدير للغرفة`);
-  } catch (error) {
-    console.error(error);
-    showToast("فشل نقل الإدارة");
-  }
-}
-
-async function transferHostToNextParticipant(roomId) {
-  const participantsSnap = await getDocs(collection(state.db, `rooms/${roomId}/participants`));
-  const aliveParticipants = participantsSnap.docs
-    .map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }))
-    .filter((participant) => participant.uid !== state.user.uid)
-    .filter((participant) => (participant.lastSeen || 0) > Date.now() - PRESENCE_TIMEOUT_MS);
-
-  if (!aliveParticipants.length) {
-    await updateDoc(doc(state.db, "rooms", roomId), {
-      isOpen: false,
-      viewerCount: 0,
-      lastActivity: serverTimestamp()
-    }).catch(() => {});
-    return;
-  }
-
-  aliveParticipants.sort((a, b) => {
-    const aJoined = a.joinedAt?.seconds || 0;
-    const bJoined = b.joinedAt?.seconds || 0;
-    if (aJoined && bJoined) {
-      return aJoined - bJoined;
-    }
-    return (a.lastSeen || 0) - (b.lastSeen || 0);
-  });
-  const nextHost = aliveParticipants[0];
-
-  const batch = writeBatch(state.db);
-  batch.update(doc(state.db, "rooms", roomId), {
-    hostUid: nextHost.uid,
-    hostName: nextHost.name,
-    hostAvatar: nextHost.avatar,
-    lastActivity: serverTimestamp()
-  });
-  batch.update(doc(state.db, `rooms/${roomId}/participants`, nextHost.uid), {
-    isHost: true
-  });
-  await batch.commit();
-}
-
-function onQueueVideosPicked(event) {
+async function assignHost(targetUid, targetName, targetAvatar) {
   if (!state.roomId) {
     return;
   }
+
+  const updates = {};
+  updates[`rooms/${state.roomId}/meta/hostUid`] = targetUid;
+  updates[`rooms/${state.roomId}/meta/hostName`] = targetName;
+  updates[`rooms/${state.roomId}/meta/hostAvatar`] = targetAvatar;
+  updates[`rooms/${state.roomId}/meta/updatedAt`] = Date.now();
+  updates[`rooms/${state.roomId}/participants/${targetUid}/isHost`] = true;
+  updates[`rooms/${state.roomId}/participants/${state.user.uid}/isHost`] = false;
+  updates[`publicRooms/${state.roomId}/hostUid`] = targetUid;
+  updates[`publicRooms/${state.roomId}/hostName`] = targetName;
+  updates[`publicRooms/${state.roomId}/hostAvatar`] = targetAvatar;
+  updates[`publicRooms/${state.roomId}/updatedAt`] = Date.now();
+
+  await update(ref(state.db), updates);
+}
+
+async function transferHostOnLeave(roomId) {
+  const participantsSnap = await get(ref(state.db, `rooms/${roomId}/participants`));
+  const raw = participantsSnap.val() || {};
+
+  const candidates = Object.values(raw)
+    .filter((participant) => participant.uid !== state.user.uid)
+    .filter((participant) => (participant.lastSeen || 0) > Date.now() - PRESENCE_TIMEOUT_MS)
+    .sort((a, b) => {
+      const byJoin = (a.joinedAt || 0) - (b.joinedAt || 0);
+      if (byJoin !== 0) {
+        return byJoin;
+      }
+      return (a.lastSeen || 0) - (b.lastSeen || 0);
+    });
+
+  if (!candidates.length) {
+    await remove(ref(state.db, `publicRooms/${roomId}`));
+    await remove(ref(state.db, `rooms/${roomId}`));
+    return;
+  }
+
+  const nextHost = candidates[0];
+  const updates = {};
+  updates[`rooms/${roomId}/meta/hostUid`] = nextHost.uid;
+  updates[`rooms/${roomId}/meta/hostName`] = nextHost.name;
+  updates[`rooms/${roomId}/meta/hostAvatar`] = nextHost.avatar;
+  updates[`rooms/${roomId}/meta/updatedAt`] = Date.now();
+  updates[`rooms/${roomId}/participants/${nextHost.uid}/isHost`] = true;
+  updates[`publicRooms/${roomId}/hostUid`] = nextHost.uid;
+  updates[`publicRooms/${roomId}/hostName`] = nextHost.name;
+  updates[`publicRooms/${roomId}/hostAvatar`] = nextHost.avatar;
+  updates[`publicRooms/${roomId}/updatedAt`] = Date.now();
+
+  await update(ref(state.db), updates);
+}
+
+async function cleanupRoomIfEmpty(roomId) {
+  const participantsSnap = await get(ref(state.db, `rooms/${roomId}/participants`));
+  const raw = participantsSnap.val() || {};
+  const active = Object.values(raw).filter((participant) => (participant.lastSeen || 0) > Date.now() - PRESENCE_TIMEOUT_MS);
+
+  if (!active.length) {
+    await remove(ref(state.db, `publicRooms/${roomId}`));
+    await remove(ref(state.db, `rooms/${roomId}`));
+  }
+}
+
+async function tryElectHostIfMissing() {
+  if (!state.roomId || !state.roomData) {
+    return;
+  }
+
+  if (state.participants.has(state.roomData.hostUid)) {
+    return;
+  }
+
+  const sorted = [...state.participants.values()].sort((a, b) => {
+    const byJoin = (a.joinedAt || 0) - (b.joinedAt || 0);
+    if (byJoin !== 0) {
+      return byJoin;
+    }
+    return (a.lastSeen || 0) - (b.lastSeen || 0);
+  });
+
+  if (!sorted.length) {
+    return;
+  }
+
+  const shouldClaim = sorted[0].uid === state.user.uid;
+  if (!shouldClaim) {
+    return;
+  }
+
+  const me = sorted[0];
+  const updates = {};
+  updates[`rooms/${state.roomId}/meta/hostUid`] = me.uid;
+  updates[`rooms/${state.roomId}/meta/hostName`] = me.name;
+  updates[`rooms/${state.roomId}/meta/hostAvatar`] = me.avatar;
+  updates[`rooms/${state.roomId}/meta/updatedAt`] = Date.now();
+  updates[`rooms/${state.roomId}/participants/${me.uid}/isHost`] = true;
+  updates[`publicRooms/${state.roomId}/hostUid`] = me.uid;
+  updates[`publicRooms/${state.roomId}/hostName`] = me.name;
+  updates[`publicRooms/${state.roomId}/hostAvatar`] = me.avatar;
+  updates[`publicRooms/${state.roomId}/updatedAt`] = Date.now();
+
+  await update(ref(state.db), updates);
+}
+
+async function syncViewerCount(count) {
+  if (!state.roomId) {
+    return;
+  }
+
+  const updates = {};
+  updates[`rooms/${state.roomId}/meta/viewerCount`] = count;
+  updates[`rooms/${state.roomId}/meta/updatedAt`] = Date.now();
+  updates[`publicRooms/${state.roomId}/viewerCount`] = count;
+  updates[`publicRooms/${state.roomId}/updatedAt`] = Date.now();
+
+  await update(ref(state.db), updates);
+}
+
+async function touchRoomActivity() {
+  if (!state.roomId) {
+    return;
+  }
+
+  const now = Date.now();
+  await update(ref(state.db), {
+    [`rooms/${state.roomId}/meta/updatedAt`]: now,
+    [`publicRooms/${state.roomId}/updatedAt`]: now
+  });
+}
+
+async function onQueueVideosPicked(event) {
+  if (!state.roomId) {
+    return;
+  }
+
   if (!state.isHost) {
-    showToast("رفع الفيديوهات لمدير الغرفة فقط");
+    showToast("تحميل الفيديوهات متاح للمدير فقط");
     event.target.value = "";
     return;
   }
@@ -1032,8 +1107,8 @@ function onQueueVideosPicked(event) {
     return;
   }
 
-  const queueItems = files.map((file) => ({
-    id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+  const items = files.map((file) => ({
+    id: `q_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
     file,
     progress: 0,
     status: "queued",
@@ -1041,7 +1116,7 @@ function onQueueVideosPicked(event) {
     error: ""
   }));
 
-  state.uploadQueue.push(...queueItems);
+  state.uploadQueue.push(...items);
   renderUploadQueue();
   processUploadQueue();
   event.target.value = "";
@@ -1062,24 +1137,14 @@ async function processUploadQueue() {
   renderUploadQueue();
 
   try {
-    const uploaded = await uploadVideoWithProgress({
-      roomId: state.roomId,
-      file: next.file,
-      onProgress: (percent) => {
-        next.progress = percent;
-        renderUploadQueue();
-      }
+    const localVideo = await prepareLocalVideo(next.file, (percent) => {
+      next.progress = percent;
+      renderUploadQueue();
     });
 
-    await addDoc(collection(state.db, `rooms/${state.roomId}/videos`), {
-      title: uploaded.title,
-      url: uploaded.url,
-      filePath: uploaded.filePath,
-      size: uploaded.size,
-      uploadedByUid: state.user.uid,
-      uploadedByName: state.profile.name,
-      uploadedAt: serverTimestamp()
-    });
+    state.localVideos.set(localVideo.id, localVideo);
+
+    await set(ref(state.db, `rooms/${state.roomId}/videos/${localVideo.id}`), buildVideoRecord(localVideo));
 
     next.status = "done";
     next.progress = 100;
@@ -1100,56 +1165,71 @@ function renderUploadQueue() {
     return;
   }
 
-  const rows = state.uploadQueue
+  refs.uploadQueueList.innerHTML = state.uploadQueue
     .map((item) => {
+      const statusText =
+        item.status === "done"
+          ? "مكتمل"
+          : item.status === "error"
+            ? "خطأ"
+            : `${Math.round(item.progress)}%`;
+
       return `
       <div class="queue-row">
         <div class="upload-header">
           <span>${escapeHtml(item.title)}</span>
-          <span>${item.status === "done" ? "مكتمل" : item.status === "error" ? "خطأ" : `${Math.round(item.progress)}%`}</span>
+          <span>${statusText}</span>
         </div>
         <div class="progress-track"><div class="progress-bar" style="width:${Math.round(item.progress)}%"></div></div>
-        ${item.error ? `<small class="error-text">${item.error}</small>` : ""}
+        ${item.error ? `<small class="error-text">${escapeHtml(item.error)}</small>` : ""}
       </div>
     `;
     })
     .join("");
-
-  refs.uploadQueueList.innerHTML = rows;
 }
 
 function renderVideosList() {
   if (!state.roomVideos.length) {
-    refs.videosList.innerHTML = `<p class="empty">لا توجد فيديوهات مرفوعة</p>`;
+    refs.videosList.innerHTML = `<p class="empty">لا توجد فيديوهات مضافة</p>`;
     return;
   }
 
-  const rows = state.roomVideos
+  refs.videosList.innerHTML = state.roomVideos
     .map((video) => {
       const isCurrent = state.roomData?.currentVideoId === video.id;
+      const availableLocally = state.localVideos.has(video.id);
+
+      let action = "";
+      if (state.isHost) {
+        if (availableLocally) {
+          action = `<button data-video-id="${video.id}" class="btn btn-secondary show-video-btn">عرض</button>`;
+        } else {
+          action = `<button class="btn btn-ghost" disabled>غير متاح محلياً</button>`;
+        }
+      }
+
       return `
       <div class="video-row">
         <div>
           <strong>${escapeHtml(video.title || "فيديو")}</strong>
-          <small>${isCurrent ? "قيد التشغيل الآن" : "جاهز للعرض"}</small>
+          <small>${isCurrent ? "قيد التشغيل الآن" : availableLocally ? "جاهز للعرض" : "موجود لدى مدير آخر"}</small>
         </div>
-        ${state.isHost ? `<button data-video-id="${video.id}" class="btn btn-secondary show-video-btn">عرض</button>` : ""}
+        ${action}
       </div>
     `;
     })
     .join("");
 
-  refs.videosList.innerHTML = rows;
-
   refs.videosList.querySelectorAll(".show-video-btn").forEach((button) => {
     button.addEventListener("click", () => {
       const videoId = button.getAttribute("data-video-id");
-      const video = state.roomVideos.find((v) => v.id === videoId);
+      const video = state.roomVideos.find((item) => item.id === videoId);
       if (!video) {
         return;
       }
+
       state.switchTargetVideo = video;
-      refs.switchVideoText.textContent = `هل تريد تشغيل "${video.title}" الآن؟`;
+      refs.switchVideoText.textContent = `هل تريد عرض "${video.title}" الآن؟`;
       openModal(refs.switchVideoModal);
     });
   });
@@ -1160,23 +1240,25 @@ async function onConfirmSwitchVideo() {
     return;
   }
 
-  const video = state.switchTargetVideo;
+  const target = state.switchTargetVideo;
+  if (!state.localVideos.has(target.id)) {
+    showToast("هذا الفيديو غير متاح على جهازك");
+    closeModal(refs.switchVideoModal);
+    state.switchTargetVideo = null;
+    return;
+  }
 
   try {
-    await updateDoc(doc(state.db, "rooms", state.roomId), {
-      currentVideoId: video.id,
-      currentVideoUrl: video.url,
-      currentVideoTitle: video.title,
-      playback: {
-        time: 0,
-        paused: true,
-        byUid: state.user.uid,
-        updatedAt: Date.now(),
-        videoId: video.id
-      },
-      lastActivity: serverTimestamp()
-    });
+    const now = Date.now();
+    const updates = {};
+    updates[`rooms/${state.roomId}/meta/currentVideoId`] = target.id;
+    updates[`rooms/${state.roomId}/meta/currentVideoTitle`] = target.title;
+    updates[`rooms/${state.roomId}/meta/updatedAt`] = now;
+    updates[`publicRooms/${state.roomId}/updatedAt`] = now;
 
+    await update(ref(state.db), updates);
+
+    loadHostLocalVideo(target.id, { autoPlay: true });
     showToast("تم تبديل الفيديو");
   } catch (error) {
     console.error(error);
@@ -1192,16 +1274,11 @@ function watchOpenRooms() {
     state.openRoomsUnsub();
   }
 
-  const roomsRef = query(collection(state.db, "rooms"), where("isOpen", "==", true));
-
-  state.openRoomsUnsub = onSnapshot(roomsRef, (snapshot) => {
-    const rooms = snapshot.docs
-      .map((roomDoc) => ({ id: roomDoc.id, ...roomDoc.data() }))
-      .sort((a, b) => {
-        const aTime = a.lastActivity?.seconds || 0;
-        const bTime = b.lastActivity?.seconds || 0;
-        return bTime - aTime;
-      });
+  state.openRoomsUnsub = onValue(ref(state.db, "publicRooms"), (snapshot) => {
+    const raw = snapshot.val() || {};
+    const rooms = Object.values(raw)
+      .filter((room) => room.isOpen)
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 
     if (!rooms.length) {
       refs.roomsList.innerHTML = `<p class="empty">لا توجد غرف مفتوحة حالياً</p>`;
@@ -1211,20 +1288,20 @@ function watchOpenRooms() {
     refs.roomsList.innerHTML = rooms
       .map((room) => {
         return `
-        <article class="room-row">
-          <div class="room-host">
-            <img class="avatar" src="${room.hostAvatar || state.profile.avatar}" alt="${escapeHtml(room.hostName || "مدير")}" />
-            <div>
-              <strong>${escapeHtml(room.name || "غرفة")}</strong>
-              <small>المدير: ${escapeHtml(room.hostName || "-")}</small>
+          <article class="room-row">
+            <div class="room-host">
+              <img class="avatar" src="${room.hostAvatar || state.profile.avatar}" alt="${escapeHtml(room.hostName || "مدير")}" />
+              <div>
+                <strong>${escapeHtml(room.name || "غرفة")}</strong>
+                <small>المدير: ${escapeHtml(room.hostName || "-")}</small>
+              </div>
             </div>
-          </div>
-          <div class="room-meta">
-            <span>${room.viewerCount || 0} متصل الآن</span>
-            <button class="btn btn-primary join-room-btn" data-room-id="${room.id}">انضمام</button>
-          </div>
-        </article>
-      `;
+            <div class="room-meta">
+              <span>${room.viewerCount || 0} متصل الآن</span>
+              <button class="btn btn-primary join-room-btn" data-room-id="${room.id}">انضمام</button>
+            </div>
+          </article>
+        `;
       })
       .join("");
 
@@ -1239,44 +1316,6 @@ function watchOpenRooms() {
   });
 }
 
-async function uploadVideoWithProgress({ roomId, file, onProgress }) {
-  const sanitizedName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
-  const filePath = `rooms/${roomId}/videos/${Date.now()}_${sanitizedName}`;
-  const storageRef = ref(state.storage, filePath);
-
-  return await new Promise((resolve, reject) => {
-    const task = uploadBytesResumable(storageRef, file, {
-      contentType: file.type || "video/mp4"
-    });
-
-    task.on(
-      "state_changed",
-      (snapshot) => {
-        const percent = Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100);
-        if (typeof onProgress === "function") {
-          onProgress(percent);
-        }
-      },
-      (error) => {
-        reject(error);
-      },
-      async () => {
-        try {
-          const url = await getDownloadURL(task.snapshot.ref);
-          resolve({
-            url,
-            filePath,
-            title: file.name,
-            size: file.size
-          });
-        } catch (error) {
-          reject(error);
-        }
-      }
-    );
-  });
-}
-
 async function copyRoomLink() {
   if (!state.roomId) {
     return;
@@ -1288,12 +1327,12 @@ async function copyRoomLink() {
     await navigator.clipboard.writeText(link);
     showToast("تم نسخ الرابط");
   } catch {
-    const input = document.createElement("input");
-    input.value = link;
-    document.body.appendChild(input);
-    input.select();
+    const temp = document.createElement("input");
+    temp.value = link;
+    document.body.appendChild(temp);
+    temp.select();
     document.execCommand("copy");
-    document.body.removeChild(input);
+    document.body.removeChild(temp);
     showToast("تم نسخ الرابط");
   }
 }
@@ -1311,20 +1350,17 @@ async function onEditName() {
   refs.roomProfileName.textContent = state.profile.name;
 
   if (state.roomId) {
-    await setDoc(
-      doc(state.db, `rooms/${state.roomId}/participants`, state.user.uid),
-      {
-        name: state.profile.name,
-        lastSeen: Date.now()
-      },
-      { merge: true }
-    );
+    const updates = {};
+    updates[`rooms/${state.roomId}/participants/${state.user.uid}/name`] = state.profile.name;
+    updates[`rooms/${state.roomId}/participants/${state.user.uid}/lastSeen`] = Date.now();
 
     if (state.isHost) {
-      await updateDoc(doc(state.db, "rooms", state.roomId), {
-        hostName: state.profile.name
-      }).catch(() => {});
+      updates[`rooms/${state.roomId}/meta/hostName`] = state.profile.name;
+      updates[`publicRooms/${state.roomId}/hostName`] = state.profile.name;
+      updates[`publicRooms/${state.roomId}/updatedAt`] = Date.now();
     }
+
+    await update(ref(state.db), updates);
   }
 
   closeModal(refs.profileMenuModal);
@@ -1340,25 +1376,23 @@ async function onChangeAvatar(event) {
   try {
     const avatar = await convertImageFileToAvatar(file);
     state.profile.avatar = avatar;
-    refs.profileAvatarPreview.src = avatar;
-    refs.roomProfileAvatar.src = avatar;
     localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(state.profile));
 
+    refs.profileAvatarPreview.src = avatar;
+    refs.roomProfileAvatar.src = avatar;
+
     if (state.roomId) {
-      await setDoc(
-        doc(state.db, `rooms/${state.roomId}/participants`, state.user.uid),
-        {
-          avatar: avatar,
-          lastSeen: Date.now()
-        },
-        { merge: true }
-      );
+      const updates = {};
+      updates[`rooms/${state.roomId}/participants/${state.user.uid}/avatar`] = avatar;
+      updates[`rooms/${state.roomId}/participants/${state.user.uid}/lastSeen`] = Date.now();
 
       if (state.isHost) {
-        await updateDoc(doc(state.db, "rooms", state.roomId), {
-          hostAvatar: avatar
-        }).catch(() => {});
+        updates[`rooms/${state.roomId}/meta/hostAvatar`] = avatar;
+        updates[`publicRooms/${state.roomId}/hostAvatar`] = avatar;
+        updates[`publicRooms/${state.roomId}/updatedAt`] = Date.now();
       }
+
+      await update(ref(state.db), updates);
     }
 
     showToast("تم تغيير الصورة");
@@ -1381,6 +1415,10 @@ async function onLogout() {
 
   localStorage.removeItem(PROFILE_STORAGE_KEY);
   state.profile = { name: "", avatar: "" };
+  state.localVideos.forEach((video) => {
+    URL.revokeObjectURL(video.url);
+  });
+  state.localVideos.clear();
 
   refs.profileForm.reset();
   refs.profileAvatarPreview.src = "";
@@ -1393,6 +1431,414 @@ async function onLogout() {
   showScreen("profile");
   closeModal(refs.profileMenuModal);
   showToast("تم تسجيل الخروج");
+}
+
+async function prepareLocalVideo(file, onProgress) {
+  onProgress?.(0);
+
+  await fakeProgress(onProgress);
+
+  const objectUrl = URL.createObjectURL(file);
+  const duration = await probeVideoDuration(objectUrl);
+
+  onProgress?.(100);
+
+  return {
+    id: `v_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    title: file.name,
+    file,
+    url: objectUrl,
+    size: file.size,
+    duration,
+    addedAt: Date.now(),
+    addedByUid: state.user.uid,
+    addedByName: state.profile.name,
+    availableHostUid: state.user.uid
+  };
+}
+
+function buildVideoRecord(video) {
+  return {
+    title: video.title,
+    size: video.size,
+    duration: video.duration,
+    addedAt: video.addedAt,
+    addedByUid: video.addedByUid,
+    addedByName: video.addedByName,
+    availableHostUid: video.availableHostUid
+  };
+}
+
+function buildPublicRoomRecord(meta) {
+  return {
+    id: meta.id,
+    name: meta.name,
+    hostUid: meta.hostUid,
+    hostName: meta.hostName,
+    hostAvatar: meta.hostAvatar,
+    viewerCount: meta.viewerCount || 0,
+    isOpen: meta.isOpen,
+    updatedAt: meta.updatedAt || Date.now()
+  };
+}
+
+async function fakeProgress(onProgress) {
+  const steps = 18;
+  for (let i = 1; i <= steps; i += 1) {
+    await sleep(38);
+    const value = Math.min(95, Math.round((i / steps) * 95));
+    onProgress?.(value);
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function probeVideoDuration(objectUrl) {
+  return new Promise((resolve) => {
+    const probe = document.createElement("video");
+    probe.preload = "metadata";
+    probe.src = objectUrl;
+
+    const done = (value) => {
+      probe.removeAttribute("src");
+      probe.load();
+      resolve(value);
+    };
+
+    probe.onloadedmetadata = () => {
+      done(Number.isFinite(probe.duration) ? probe.duration : 0);
+    };
+    probe.onerror = () => done(0);
+  });
+}
+
+function ensureHostCaptureStream() {
+  if (!state.isHost) {
+    return null;
+  }
+
+  if (state.hostStream && state.hostStream.active) {
+    return state.hostStream;
+  }
+
+  const video = refs.roomVideo;
+
+  if (typeof video.captureStream === "function") {
+    state.hostStream = video.captureStream();
+  } else if (typeof video.webkitCaptureStream === "function") {
+    state.hostStream = video.webkitCaptureStream();
+  } else {
+    showToast("المتصفح لا يدعم بث الفيديو المباشر من الصفحة");
+    return null;
+  }
+
+  return state.hostStream;
+}
+
+function closeAllHostPeers() {
+  for (const pc of state.hostPeers.values()) {
+    try {
+      pc.close();
+    } catch {
+      // no-op
+    }
+  }
+  state.hostPeers.clear();
+}
+
+function closeViewerPeer() {
+  if (state.viewerPeer) {
+    try {
+      state.viewerPeer.close();
+    } catch {
+      // no-op
+    }
+  }
+
+  state.viewerPeer = null;
+  state.viewerHostUid = null;
+
+  if (!state.isHost) {
+    const video = refs.roomVideo;
+    if (video.srcObject) {
+      video.srcObject = null;
+    }
+  }
+}
+
+function reconcileHostPeers(targetViewerUids) {
+  if (!state.isHost) {
+    return;
+  }
+
+  const setOfTargets = new Set(targetViewerUids);
+
+  for (const [viewerUid, pc] of state.hostPeers.entries()) {
+    if (!setOfTargets.has(viewerUid)) {
+      try {
+        pc.close();
+      } catch {
+        // no-op
+      }
+      state.hostPeers.delete(viewerUid);
+    }
+  }
+
+  targetViewerUids.forEach((viewerUid) => {
+    ensureHostPeer(viewerUid, { sendOffer: true }).catch((error) => {
+      console.error(error);
+    });
+  });
+}
+
+async function ensureHostPeer(viewerUid, { sendOffer = false } = {}) {
+  if (!state.roomId || !state.isHost || viewerUid === state.user.uid) {
+    return;
+  }
+
+  let pc = state.hostPeers.get(viewerUid);
+
+  if (!pc) {
+    pc = new RTCPeerConnection(RTC_CONFIG);
+    state.hostPeers.set(viewerUid, pc);
+
+    pc.onicecandidate = (event) => {
+      if (!event.candidate) {
+        return;
+      }
+      sendSignal(viewerUid, {
+        type: "candidate",
+        candidate: event.candidate.toJSON ? event.candidate.toJSON() : event.candidate
+      }).catch(() => {});
+    };
+
+    pc.onconnectionstatechange = () => {
+      const status = pc.connectionState;
+      if (status === "failed" || status === "closed" || status === "disconnected") {
+        try {
+          pc.close();
+        } catch {
+          // no-op
+        }
+        state.hostPeers.delete(viewerUid);
+      }
+    };
+
+    attachHostTracksToPeer(pc);
+  }
+
+  if (sendOffer && pc.signalingState === "stable") {
+    await createAndSendOffer(viewerUid, pc);
+  }
+}
+
+function attachHostTracksToPeer(pc) {
+  const stream = ensureHostCaptureStream();
+  if (!stream) {
+    return;
+  }
+
+  const existingTrackIds = new Set(pc.getSenders().map((sender) => sender.track?.id).filter(Boolean));
+
+  stream.getTracks().forEach((track) => {
+    if (!existingTrackIds.has(track.id)) {
+      pc.addTrack(track, stream);
+    }
+  });
+}
+
+async function renegotiateAllHostPeers() {
+  if (!state.isHost) {
+    return;
+  }
+
+  for (const [viewerUid, pc] of state.hostPeers.entries()) {
+    if (pc.signalingState === "stable") {
+      attachHostTracksToPeer(pc);
+      await createAndSendOffer(viewerUid, pc).catch(() => {});
+    }
+  }
+}
+
+async function createAndSendOffer(targetUid, pc) {
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  await sendSignal(targetUid, {
+    type: "offer",
+    sdp: {
+      type: offer.type,
+      sdp: offer.sdp
+    }
+  });
+}
+
+function createViewerPeer(hostUid) {
+  if (state.viewerPeer && state.viewerHostUid === hostUid) {
+    return state.viewerPeer;
+  }
+
+  closeViewerPeer();
+
+  const pc = new RTCPeerConnection(RTC_CONFIG);
+  state.viewerPeer = pc;
+  state.viewerHostUid = hostUid;
+
+  pc.onicecandidate = (event) => {
+    if (!event.candidate) {
+      return;
+    }
+
+    sendSignal(hostUid, {
+      type: "candidate",
+      candidate: event.candidate.toJSON ? event.candidate.toJSON() : event.candidate
+    }).catch(() => {});
+  };
+
+  pc.ontrack = (event) => {
+    const [stream] = event.streams;
+    if (!stream) {
+      return;
+    }
+
+    const video = refs.roomVideo;
+    if (video.src) {
+      video.removeAttribute("src");
+      video.load();
+    }
+    video.srcObject = stream;
+    video.play().catch(() => {});
+  };
+
+  pc.onconnectionstatechange = () => {
+    const status = pc.connectionState;
+    if (status === "failed" || status === "disconnected" || status === "closed") {
+      if (!state.isHost) {
+        state.hasRequestedInitialOffer = false;
+      }
+    }
+  };
+
+  return pc;
+}
+
+async function handleSignal(signal) {
+  if (!state.roomId) {
+    return;
+  }
+
+  const fromUid = signal.from;
+  if (!fromUid || fromUid === state.user.uid) {
+    return;
+  }
+
+  if (signal.type === "request-offer") {
+    if (state.isHost) {
+      await ensureHostPeer(fromUid, { sendOffer: true });
+    }
+    return;
+  }
+
+  if (signal.type === "offer") {
+    if (state.isHost) {
+      return;
+    }
+
+    const pc = createViewerPeer(fromUid);
+
+    if (pc.signalingState !== "stable") {
+      closeViewerPeer();
+      const fresh = createViewerPeer(fromUid);
+      await fresh.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+      const answer = await fresh.createAnswer();
+      await fresh.setLocalDescription(answer);
+
+      await sendSignal(fromUid, {
+        type: "answer",
+        sdp: {
+          type: answer.type,
+          sdp: answer.sdp
+        }
+      });
+
+      state.hasRequestedInitialOffer = true;
+      return;
+    }
+
+    await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    await sendSignal(fromUid, {
+      type: "answer",
+      sdp: {
+        type: answer.type,
+        sdp: answer.sdp
+      }
+    });
+
+    state.hasRequestedInitialOffer = true;
+    return;
+  }
+
+  if (signal.type === "answer") {
+    if (!state.isHost) {
+      return;
+    }
+
+    const pc = state.hostPeers.get(fromUid);
+    if (!pc) {
+      return;
+    }
+
+    await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+    return;
+  }
+
+  if (signal.type === "candidate") {
+    if (state.isHost) {
+      const pc = state.hostPeers.get(fromUid);
+      if (!pc) {
+        return;
+      }
+      await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+      return;
+    }
+
+    if (!state.viewerPeer || state.viewerHostUid !== fromUid) {
+      return;
+    }
+
+    await state.viewerPeer.addIceCandidate(new RTCIceCandidate(signal.candidate));
+  }
+}
+
+async function sendSignal(targetUid, payload) {
+  if (!state.roomId || !targetUid) {
+    return;
+  }
+
+  await push(ref(state.db, `rooms/${state.roomId}/signals/${targetUid}`), {
+    ...payload,
+    from: state.user.uid,
+    ts: Date.now()
+  });
+}
+
+function requestOfferFromCurrentHost() {
+  if (!state.roomId || state.isHost || !state.roomData?.hostUid) {
+    return;
+  }
+
+  const now = Date.now();
+  if (now - state.lastOfferRequestAt < OFFER_REQUEST_COOLDOWN_MS) {
+    return;
+  }
+
+  state.lastOfferRequestAt = now;
+  sendSignal(state.roomData.hostUid, { type: "request-offer" }).catch(() => {});
 }
 
 function openDrawer() {
@@ -1424,9 +1870,9 @@ function showScreen(name) {
 }
 
 function updateProgress(progressEl, textEl, value) {
-  const safeValue = Math.max(0, Math.min(100, Math.round(value)));
-  progressEl.style.width = `${safeValue}%`;
-  textEl.textContent = `${safeValue}%`;
+  const safe = Math.max(0, Math.min(100, Math.round(value)));
+  progressEl.style.width = `${safe}%`;
+  textEl.textContent = `${safe}%`;
 }
 
 function generateRoomId() {
@@ -1437,16 +1883,16 @@ function setRoomInUrl(roomId) {
   const params = new URLSearchParams(window.location.search);
   params.set("room", roomId);
   const query = params.toString();
-  const url = `${window.location.pathname}${query ? `?${query}` : ""}`;
-  window.history.replaceState({}, "", url);
+  const next = `${window.location.pathname}${query ? `?${query}` : ""}`;
+  window.history.replaceState({}, "", next);
 }
 
 function clearRoomInUrl() {
   const params = new URLSearchParams(window.location.search);
   params.delete("room");
   const query = params.toString();
-  const url = `${window.location.pathname}${query ? `?${query}` : ""}`;
-  window.history.replaceState({}, "", url);
+  const next = `${window.location.pathname}${query ? `?${query}` : ""}`;
+  window.history.replaceState({}, "", next);
 }
 
 function showToast(text) {
@@ -1457,26 +1903,19 @@ function showToast(text) {
 
 function humanizeFirebaseError(error) {
   const code = error?.code || "";
+  const msg = String(error?.message || "").toLowerCase();
+
   if (code.includes("permission-denied")) {
-    return "الصلاحيات مرفوضة. راجع قواعد Firestore/Storage";
+    return "الصلاحيات مرفوضة. راجع قواعد Realtime Database";
   }
-  if (code === "storage/unauthorized") {
-    return "رفع الفيديو مرفوض. تحقق من قواعد Firebase Storage";
+  if (code.includes("network-request-failed")) {
+    return "مشكلة اتصال بالشبكة";
   }
-  if (code === "storage/invalid-default-bucket") {
-    return "اسم storageBucket غير صحيح في إعدادات Firebase";
+  if (code.includes("auth/admin-restricted-operation")) {
+    return "فعّل Anonymous Authentication في Firebase";
   }
-  if (code === "auth/admin-restricted-operation") {
-    return "Anonymous Auth غير مفعّل في Firebase Authentication";
-  }
-  if (code === "storage/retry-limit-exceeded") {
-    return "انقطع رفع الفيديو. جرّب اتصال أقوى أو ملف أصغر";
-  }
-  if (code === "storage/canceled") {
-    return "تم إلغاء رفع الفيديو";
-  }
-  if (code === "storage/unknown") {
-    return "خطأ غير متوقع في التخزين. تحقق من bucket والقواعد";
+  if (msg.includes("databaseurl") || msg.includes("database url")) {
+    return "databaseURL غير صحيح. خذه من Firebase Console > Realtime Database";
   }
   if (code) {
     return `خطأ Firebase: ${code}`;
@@ -1513,17 +1952,17 @@ async function convertImageFileToAvatar(file) {
   const fileDataUrl = await fileToDataUrl(file);
   const image = await loadImage(fileDataUrl);
 
-  const maxSize = 180;
+  const size = 180;
   const canvas = document.createElement("canvas");
-  canvas.width = maxSize;
-  canvas.height = maxSize;
-  const ctx = canvas.getContext("2d");
+  canvas.width = size;
+  canvas.height = size;
 
+  const ctx = canvas.getContext("2d");
   const minSide = Math.min(image.width, image.height);
   const sx = (image.width - minSide) / 2;
   const sy = (image.height - minSide) / 2;
 
-  ctx.drawImage(image, sx, sy, minSide, minSide, 0, 0, maxSize, maxSize);
+  ctx.drawImage(image, sx, sy, minSide, minSide, 0, 0, size, size);
   return canvas.toDataURL("image/jpeg", 0.82);
 }
 
