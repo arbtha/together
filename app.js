@@ -305,6 +305,11 @@ async function onProfileAvatarPicked(event) {
 async function onProfileSubmit(event) {
   event.preventDefault();
 
+  if (!state.user) {
+    showToast("فشل تسجيل الدخول المجهول. فعّل Anonymous Auth في Firebase");
+    return;
+  }
+
   const name = refs.profileNameInput.value.trim();
   if (!name) {
     showToast("اكتب الاسم أولاً");
@@ -422,7 +427,7 @@ async function onCreateRoomSubmit(event) {
     showToast("تم إنشاء الغرفة بنجاح");
   } catch (error) {
     console.error(error);
-    showToast("فشل إنشاء الغرفة أو رفع الفيديو");
+    showToast(humanizeFirebaseError(error));
   } finally {
     refs.createRoomSubmitBtn.disabled = false;
   }
@@ -477,7 +482,7 @@ async function joinRoom(roomId) {
     applyRoomHeader(roomData);
   } catch (error) {
     console.error(error);
-    showToast("تعذر الانضمام للغرفة");
+    showToast(humanizeFirebaseError(error));
   }
 }
 
@@ -1081,7 +1086,7 @@ async function processUploadQueue() {
   } catch (error) {
     console.error(error);
     next.status = "error";
-    next.error = "فشل الرفع";
+    next.error = humanizeFirebaseError(error);
   } finally {
     state.isUploadingQueue = false;
     renderUploadQueue();
@@ -1448,6 +1453,35 @@ function showToast(text) {
   refs.toast.textContent = text;
   refs.toast.classList.add("show");
   setTimeout(() => refs.toast.classList.remove("show"), 2400);
+}
+
+function humanizeFirebaseError(error) {
+  const code = error?.code || "";
+  if (code.includes("permission-denied")) {
+    return "الصلاحيات مرفوضة. راجع قواعد Firestore/Storage";
+  }
+  if (code === "storage/unauthorized") {
+    return "رفع الفيديو مرفوض. تحقق من قواعد Firebase Storage";
+  }
+  if (code === "storage/invalid-default-bucket") {
+    return "اسم storageBucket غير صحيح في إعدادات Firebase";
+  }
+  if (code === "auth/admin-restricted-operation") {
+    return "Anonymous Auth غير مفعّل في Firebase Authentication";
+  }
+  if (code === "storage/retry-limit-exceeded") {
+    return "انقطع رفع الفيديو. جرّب اتصال أقوى أو ملف أصغر";
+  }
+  if (code === "storage/canceled") {
+    return "تم إلغاء رفع الفيديو";
+  }
+  if (code === "storage/unknown") {
+    return "خطأ غير متوقع في التخزين. تحقق من bucket والقواعد";
+  }
+  if (code) {
+    return `خطأ Firebase: ${code}`;
+  }
+  return "حدث خطأ غير متوقع";
 }
 
 function formatTime(inputSeconds) {
